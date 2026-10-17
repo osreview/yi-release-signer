@@ -1,0 +1,235 @@
+# Yi production authorization signer.
+#
+# This file lives in a PUBLIC repository owned by a dedicated release approver
+# account (<approver>/yi-release-signer, path .github/workflows/sign.yml). Agents
+# never hold that account's credentials, so they can neither change what this
+# workflow signs nor satisfy the Workload Identity condition that gates the key.
+# The Yi repository keeps a byte-identical reference copy at
+# infra/release-signer/sign.yml and CI fails when the two differ.
+#
+# It signs only the production authorization whose id the approver typed into the
+# Yi workflow_dispatch confirmation. The caller cannot widen that: the typed text
+# is read from the dispatch event, and every target below is a constant here.
+name: Yi production authorization signer
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        description: backend-deploy or site-deploy
+        type: string
+        required: true
+      statement_b64:
+        description: Base64 of the canonical 13-line yi-production-authorization-v1 statement
+        type: string
+        required: true
+    outputs:
+      authorization_id:
+        value: ${{ jobs.sign.outputs.authorization_id }}
+      issued_at:
+        value: ${{ jobs.sign.outputs.issued_at }}
+      not_after:
+        value: ${{ jobs.sign.outputs.not_after }}
+      signer_run_id:
+        value: ${{ jobs.sign.outputs.signer_run_id }}
+      production_sig_b64:
+        value: ${{ jobs.sign.outputs.production_sig_b64 }}
+      control_statement_b64:
+        value: ${{ jobs.sign.outputs.control_statement_b64 }}
+      control_sig_b64:
+        value: ${{ jobs.sign.outputs.control_sig_b64 }}
+
+permissions: {}
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    env:
+      YI_REPOSITORY_ID: "1252183364"
+      YI_BACKEND_WORKFLOW_REF: ChicagoRunner/Yi/.github/workflows/deploy-gcp-backend.yml@refs/heads/main
+      YI_SITE_WORKFLOW_REF: ChicagoRunner/Yi/.github/workflows/deploy-gcp-site.yml@refs/heads/main
+      WIF_PROVIDER: projects/387339142238/locations/global/workloadIdentityPools/yi-prod-authorize/providers/github-approver
+      SIGNER_SERVICE_ACCOUNT: yi-prod-signer@oneyi-prod.iam.gserviceaccount.com
+      KMS_KEY_VERSION: projects/oneyi-prod/locations/asia-southeast1/keyRings/yi-release/cryptoKeys/production-authorization/cryptoKeyVersions/1
+      KMS_PUBLIC_KEY_SHA256: 215125865ee24859929c5f5162c2c5b3dff87c9c293e7dc20e73919f05ab6a1f
+      VALIDITY_SECONDS: "1800"
+    outputs:
+      authorization_id: ${{ steps.request.outputs.authorization_id }}
+      issued_at: ${{ steps.sign.outputs.issued_at }}
+      not_after: ${{ steps.sign.outputs.not_after }}
+      signer_run_id: ${{ steps.sign.outputs.signer_run_id }}
+      production_sig_b64: ${{ steps.sign.outputs.production_sig_b64 }}
+      control_statement_b64: ${{ steps.sign.outputs.control_statement_b64 }}
+      control_sig_b64: ${{ steps.sign.outputs.control_sig_b64 }}
+    steps:
+      - name: Bind the request to the approver's typed confirmation
+        id: request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          DISPATCH_ACTION: ${{ github.event.inputs.release_action }}
+          DISPATCH_PREPARE_RUN_ID: ${{ github.event.inputs.prepare_run_id }}
+          DISPATCH_CONFIRM: ${{ github.event.inputs.confirm }}
+          OPERATION: ${{ inputs.operation }}
+          STATEMENT_B64: ${{ inputs.statement_b64 }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1" >&2; exit 1; }
+          [ "${EVENT_NAME}" = workflow_dispatch ] || fail "only a manual approver dispatch can be signed"
+          [ "${RUN_ATTEMPT}" = 1 ] || fail "re-runs are never signed; dispatch again"
+          [ "${REPOSITORY_ID}" = "${YI_REPOSITORY_ID}" ] || fail "caller is not the Yi repository"
+          [ "${CALLER_REF}" = refs/heads/main ] || fail "caller must run from Yi main"
+          case "${CALLER_WORKFLOW_REF}" in
+            "${YI_BACKEND_WORKFLOW_REF}") expected_operation=backend-deploy; confirm_prefix=deploy-gcp-prepared ;;
+            "${YI_SITE_WORKFLOW_REF}") expected_operation=site-deploy; confirm_prefix=deploy-gcp-site-prepared ;;
+            *) fail "caller workflow is not an approved Yi GCP deploy workflow" ;;
+          esac
+          [ "${OPERATION}" = "${expected_operation}" ] || fail "operation does not match the caller workflow"
+          case "${DISPATCH_ACTION}" in deploy-prepared|authorize-only) ;; *) fail "release action cannot be signed" ;; esac
+          [[ "${DISPATCH_PREPARE_RUN_ID}" =~ ^[1-9][0-9]*$ ]] || fail "prepare run id is invalid"
+          [[ "${DISPATCH_CONFIRM}" =~ ^${confirm_prefix}\ ([1-9][0-9]*)\ ([a-f0-9]{64})$ ]] \
+            || fail "confirmation must be exactly: ${confirm_prefix} <prepare_run_id> <authorization_id>"
+          [ "${BASH_REMATCH[1]}" = "${DISPATCH_PREPARE_RUN_ID}" ] || fail "confirmation names a different prepare run"
+          approved_id="${BASH_REMATCH[2]}"
+
+          work="${RUNNER_TEMP}/yi-sign"
+          rm -rf "${work}" && mkdir -m 0700 "${work}"
+          [[ "${STATEMENT_B64}" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ "${#STATEMENT_B64}" -le 4096 ] \
+            || fail "statement encoding is invalid"
+          printf '%s' "${STATEMENT_B64}" | base64 -d >"${work}/statement"
+          python3 -I - "${work}/statement" "${expected_operation}" <<'PY'
+          import re
+          import sys
+
+          path, operation = sys.argv[1:]
+          data = open(path, "rb").read()
+          sha40, sha64 = r"[a-f0-9]{40}", r"[a-f0-9]{64}"
+          image = r"(none|[A-Za-z0-9._/-]+@sha256:[a-f0-9]{64})" if operation == "backend-deploy" else r"none"
+          hosts = r"[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*" if operation == "backend-deploy" else r"unchanged"
+          archive = sha64 if operation == "backend-deploy" else r"none"
+          expected = [
+              r"yi-production-authorization-v1",
+              rf"operation={operation}",
+              rf"release_sha={sha40}",
+              rf"image_ref={image}",
+              rf"control_release_sha={sha40}",
+              rf"control_bundle_sha256={sha64}",
+              rf"trust_base_release_sha={sha40}",
+              rf"trust_base_sha256={sha64}",
+              rf"control_archive_sha256={archive}",
+              rf"site_archive_sha256={sha64}",
+              rf"site_hosts={hosts}",
+              rf"arguments_sha256={sha64}",
+              rf"authorization_nonce={sha64}",
+          ]
+          try:
+              text = data.decode("ascii")
+          except UnicodeDecodeError:
+              raise SystemExit("statement is not ASCII")
+          if not text.endswith("\n") or "\r" in text:
+              raise SystemExit("statement must use LF line endings and end with LF")
+          lines = text[:-1].split("\n")
+          if len(lines) != len(expected):
+              raise SystemExit("statement must have exactly 13 lines")
+          for line, pattern in zip(lines, expected):
+              if not re.fullmatch(pattern, line):
+                  raise SystemExit(f"statement line does not match the canonical format: {line.split('=')[0]}")
+          PY
+          actual_id="$(sha256sum "${work}/statement" | awk '{print $1}')"
+          [ "${actual_id}" = "${approved_id}" ] || fail "statement is not the one the approver confirmed"
+          echo "authorization_id=${actual_id}" >>"${GITHUB_OUTPUT}"
+          {
+            echo "### Production authorization request"
+            echo
+            echo "- Operation: \`${expected_operation}\`"
+            echo "- Prepare run: \`${DISPATCH_PREPARE_RUN_ID}\`"
+            echo "- Authorization id: \`${actual_id}\`"
+            echo
+            echo '```text'
+            cat "${work}/statement"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Authenticate as the signer
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SIGNER_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 300s
+          create_credentials_file: false
+
+      - name: Sign the envelope and control statement in Cloud KMS
+        id: sign
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          AUTHORIZATION_ID: ${{ steps.request.outputs.authorization_id }}
+          OPERATION: ${{ inputs.operation }}
+          SIGNER_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1" >&2; exit 1; }
+          work="${RUNNER_TEMP}/yi-sign"
+          kms() {
+            curl --fail-with-body --silent --show-error --max-time 30 \
+              -H "Authorization: Bearer ${ACCESS_TOKEN}" -H "Content-Type: application/json" "$@"
+          }
+          kms "https://cloudkms.googleapis.com/v1/${KMS_KEY_VERSION}/publicKey" >"${work}/public.json"
+          [ "$(jq -r .algorithm "${work}/public.json")" = RSA_SIGN_PSS_3072_SHA256 ] || fail "unexpected key algorithm"
+          [ "$(jq -r .protectionLevel "${work}/public.json")" = HSM ] || fail "unexpected key protection level"
+          jq -r .pem "${work}/public.json" >"${work}/public.pem"
+          key_sha256="$(openssl pkey -pubin -in "${work}/public.pem" -outform DER | sha256sum | awk '{print $1}')"
+          [ "${key_sha256}" = "${KMS_PUBLIC_KEY_SHA256}" ] || fail "KMS public key is not the pinned production key"
+
+          sign_file() {
+            local message="$1" signature="$2" digest
+            digest="$(openssl dgst -sha256 -binary "${message}" | base64 -w0)"
+            kms -X POST "https://cloudkms.googleapis.com/v1/${KMS_KEY_VERSION}:asymmetricSign" \
+              -d "{\"digest\":{\"sha256\":\"${digest}\"}}" >"${work}/response.json"
+            [ "$(jq -r .name "${work}/response.json")" = "${KMS_KEY_VERSION}" ] || fail "KMS signed with an unexpected key version"
+            jq -r .signature "${work}/response.json" | base64 -d >"${signature}"
+            [ "$(stat -c %s "${signature}")" = 384 ] || fail "signature must be 384 bytes"
+            openssl dgst -sha256 -verify "${work}/public.pem" -signature "${signature}" \
+              -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest "${message}" >/dev/null \
+              || fail "KMS signature does not verify against the pinned key"
+          }
+
+          issued_at="$(date -u +%s)"
+          not_after=$((issued_at + VALIDITY_SECONDS))
+          printf 'yi-production-authorization-envelope-v1\nauthorization_id=%s\nissued_at=%s\nnot_after=%s\nsigner_run_id=%s\n' \
+            "${AUTHORIZATION_ID}" "${issued_at}" "${not_after}" "${SIGNER_RUN_ID}" >"${work}/envelope"
+          sign_file "${work}/envelope" "${work}/envelope.sig"
+
+          control_statement_b64=""
+          control_sig_b64=""
+          if [ "${OPERATION}" = backend-deploy ]; then
+            control_release_sha="$(sed -n 's/^control_release_sha=\([a-f0-9]\{40\}\)$/\1/p' "${work}/statement")"
+            control_bundle_sha256="$(sed -n 's/^control_bundle_sha256=\([a-f0-9]\{64\}\)$/\1/p' "${work}/statement")"
+            printf 'yi-control-authorization-v1\nrelease_sha=%s\nbundle_sha256=%s\n' \
+              "${control_release_sha}" "${control_bundle_sha256}" >"${work}/control.statement"
+            sign_file "${work}/control.statement" "${work}/control.sig"
+            control_statement_b64="$(base64 -w0 "${work}/control.statement")"
+            control_sig_b64="$(base64 -w0 "${work}/control.sig")"
+          fi
+
+          {
+            echo "issued_at=${issued_at}"
+            echo "not_after=${not_after}"
+            echo "signer_run_id=${SIGNER_RUN_ID}"
+            echo "production_sig_b64=$(base64 -w0 "${work}/envelope.sig")"
+            echo "control_statement_b64=${control_statement_b64}"
+            echo "control_sig_b64=${control_sig_b64}"
+          } >>"${GITHUB_OUTPUT}"
+          {
+            echo
+            echo "Signed with \`${KMS_KEY_VERSION}\` (public key sha256 \`${key_sha256}\`)."
+            echo "Valid until $(date -u -d "@${not_after}" +%Y-%m-%dT%H:%M:%SZ)."
+          } >>"${GITHUB_STEP_SUMMARY}"
+          rm -rf "${work}"
